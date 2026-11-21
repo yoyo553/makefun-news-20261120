@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """make.fun entry: sum up 20 November 2026 world news in one image.
 
-Python 3.13, standard library only, no network, fully deterministic.
-Draws a newspaper front page (1024x1024) with a built-in bitmap font
-and writes it to the output directory as entry.png:
-MAKEFUN_OUTPUT_DIR if set, else /output if usable, else ./out.
-Running it twice writes exactly the same bytes.
+Version 3: modelled on what the top-ranked entries do. One newspaper
+page with a giant date, a "day in numbers" strip, a region bar, 3
+illustrated hero stories, 9 featured cards, a dot world map with
+pins, a numbered "also today" wire list, and a date-check box that
+names what was left out for not being today's news. 36 verified
+stories. Python 3.13, standard library only, no network, fully
+deterministic. Writes entry.png to MAKEFUN_OUTPUT_DIR if set, else
+/output if usable, else ./out. Two runs are byte-identical.
 """
 
 import math
@@ -13,19 +16,22 @@ import os
 import struct
 import zlib
 
-WIDTH = 1024
-HEIGHT = 1024
+PAGE_W = 1024
+PAGE_H = 1024
 
-PAPER = (252, 252, 250)
+PAPER = (250, 247, 240)
 INK = (16, 22, 44)
-ACCENT = (198, 32, 44)
-GRAY = (96, 104, 128)
+RED = (198, 32, 44)
+GREY = (96, 104, 128)
+CARD = (255, 255, 255)
+SKY = (18, 28, 58)
+SEA = (64, 120, 160)
+SAND = (226, 205, 160)
+GREEN = (96, 140, 80)
+GOLD = (240, 180, 60)
+MAPLAND = (120, 130, 150)
 
-# ---------------------------------------------------------------------------
-# 5x7 bitmap font: uppercase letters, digits and basic punctuation.
-# ---------------------------------------------------------------------------
-
-FONT = {
+GLYPHS = {
     "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
     "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
     "C": (".####", "#....", "#....", "#....", "#....", "#....", ".####"),
@@ -68,286 +74,472 @@ FONT = {
     "'": ("..#..", "..#..", ".#...", ".....", ".....", ".....", "....."),
     "%": ("##..#", "##.#.", "....#", "...#.", "..#..", ".#.##", "#..##"),
     "-": (".....", ".....", ".....", "#####", ".....", ".....", "....."),
+    "!": ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
+    "&": (".##..", "#..#.", "#.#..", ".#...", "#.#.#", "#..#.", ".##.#"),
+    "+": (".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
+    "$": ("..#..", ".####", "#.#..", ".###.", "..#.#", "####.", "..#.."),
+    ":": (".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."),
+    "/": ("....#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...."),
+    "(": (".#...", "#....", "#....", "#....", "#....", "#....", ".#..."),
+    ")": ("...#.", "....#", "....#", "....#", "....#", "....#", "...#."),
 }
 
-# ---------------------------------------------------------------------------
-# Canvas helpers. The canvas is a list of bytearray rows, 3 bytes per pixel.
-# ---------------------------------------------------------------------------
+
+def new_page():
+    row = bytearray(bytes(PAPER) * PAGE_W)
+    return [bytearray(row) for _ in range(PAGE_H)]
 
 
-def make_canvas(width, height, color):
-    row = bytearray(bytes(color) * width)
-    return [bytearray(row) for _ in range(height)]
-
-
-def fill_rect(canvas, x0, y0, x1, y1, color):
-    height = len(canvas)
-    width = len(canvas[0]) // 3
+def rect(page, x0, y0, x1, y1, color):
     x0 = max(0, x0)
     y0 = max(0, y0)
-    x1 = min(width, x1)
-    y1 = min(height, y1)
+    x1 = min(PAGE_W, x1)
+    y1 = min(PAGE_H, y1)
     if x1 <= x0 or y1 <= y0:
         return
-    segment = bytes(color) * (x1 - x0)
-    for y in range(y0, y1):
-        canvas[y][x0 * 3 : x1 * 3] = segment
+    seg = bytes(color) * (x1 - x0)
+    for yy in range(y0, y1):
+        page[yy][x0 * 3 : x1 * 3] = seg
 
 
-def plot(canvas, cx, cy, size, color):
+def dot(page, cx, cy, size, color):
     half = size // 2
-    fill_rect(canvas, cx - half, cy - half, cx - half + size, cy - half + size, color)
+    rect(page, cx - half, cy - half, cx - half + size, cy - half + size, color)
 
 
-def draw_line(canvas, x0, y0, x1, y1, size, color):
+def line(page, x0, y0, x1, y1, size, color):
     steps = int(max(abs(x1 - x0), abs(y1 - y0))) or 1
     for i in range(steps + 1):
-        x = x0 + (x1 - x0) * i / steps
-        y = y0 + (y1 - y0) * i / steps
-        plot(canvas, int(round(x)), int(round(y)), size, color)
+        dot(
+            page,
+            int(round(x0 + (x1 - x0) * i / steps)),
+            int(round(y0 + (y1 - y0) * i / steps)),
+            size,
+            color,
+        )
 
 
-def draw_polyline(canvas, points, size, color):
-    for (ax, ay), (bx, by) in zip(points, points[1:]):
-        draw_line(canvas, ax, ay, bx, by, size, color)
+def poly(page, pts, size, color):
+    for a, b in zip(pts, pts[1:]):
+        line(page, a[0], a[1], b[0], b[1], size, color)
 
 
-def draw_circle(canvas, cx, cy, radius, size, color):
+def ring(page, cx, cy, r, size, color, squash=1.0):
     for deg in range(0, 360, 2):
         rad = math.radians(deg)
-        x = cx + radius * math.cos(rad)
-        y = cy + radius * math.sin(rad)
-        plot(canvas, int(round(x)), int(round(y)), size, color)
+        dot(
+            page,
+            int(round(cx + r * squash * math.cos(rad))),
+            int(round(cy + r * math.sin(rad))),
+            size,
+            color,
+        )
 
 
-def draw_text(canvas, x, y, text, scale, color):
-    advance = 6 * scale
-    for ch in text.upper():
-        glyph = FONT.get(ch, FONT[" "])
-        for row_i, row in enumerate(glyph):
-            for col_i, cell in enumerate(row):
+def disc(page, cx, cy, r, color):
+    for yy in range(cy - r, cy + r + 1):
+        dx = int(math.sqrt(max(0, r * r - (yy - cy) ** 2)))
+        rect(page, cx - dx, yy, cx + dx + 1, yy + 1, color)
+
+
+def text(page, x, y, s, scale, color, advance=None, bold=False):
+    step = advance if advance is not None else 6 * scale
+    offsets = (0, max(1, scale // 3)) if bold else (0,)
+    for ch in s.upper():
+        glyph = GLYPHS.get(ch, GLYPHS[" "])
+        for ri, row in enumerate(glyph):
+            for ci, cell in enumerate(row):
                 if cell == "#":
-                    fill_rect(
-                        canvas,
-                        x + col_i * scale,
-                        y + row_i * scale,
-                        x + (col_i + 1) * scale,
-                        y + (row_i + 1) * scale,
-                        color,
-                    )
-        x += advance
+                    for off in offsets:
+                        rect(
+                            page,
+                            x + ci * scale + off,
+                            y + ri * scale,
+                            x + (ci + 1) * scale + off,
+                            y + (ri + 1) * scale,
+                            color,
+                        )
+        x += step
     return x
 
 
-def text_width(text, scale):
-    return len(text) * 6 * scale - scale
+def text_mid(page, y, s, scale, color):
+    w = len(s) * 6 * scale - scale
+    text(page, (PAGE_W - w) // 2, y, s, scale, color)
 
 
-def draw_text_centered(canvas, y, text, scale, color):
-    x = (WIDTH - text_width(text, scale)) // 2
-    draw_text(canvas, x, y, text, scale, color)
+def text_w(s, scale):
+    return len(s) * 6 * scale - scale
 
 
-def wrap_text(text, max_chars):
-    lines = []
-    current = ""
-    for word in text.split():
-        trial = word if not current else current + " " + word
+def wrap(s, max_chars):
+    out, cur = [], ""
+    for word in s.split():
+        trial = word if not cur else cur + " " + word
         if len(trial) <= max_chars:
-            current = trial
+            cur = trial
         else:
-            lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines
+            out.append(cur)
+            cur = word
+    if cur:
+        out.append(cur)
+    return out
 
+
+# Coarse dot world map, 90x40 cells, equirectangular-ish.
+WORLD = [
+    "                                                                                          ",
+    "                                                                                          ",
+    "   #####        ###############################################                           ",
+    "  #########    #####################################################                      ",
+    " ############# #######################################################                    ",
+    "  ##########################  ########################################                    ",
+    "   ########################   #########################################                   ",
+    "    ######################     ########################################                   ",
+    "     ####################       #######################################                   ",
+    "     ##################          #####################################                    ",
+    "      ################            ###################################                     ",
+    "       ##############              #################################                      ",
+    "        ###########                 ###############################                       ",
+    "         ########                    #############################                        ",
+    "          ######                      ##########################                          ",
+    "          #####                        ########################                           ",
+    "          ######                        ######################                            ",
+    "          #######                        ####################                             ",
+    "          ########                        ##################                              ",
+    "           #######                         ################                               ",
+    "           ########                         ##############                                ",
+    "            ######                           ############         ##########              ",
+    "            #####                             ##########         ############             ",
+    "             ####                              ########           ############            ",
+    "             ###                                ######             ##########             ",
+    "             ##                                  ####               ########              ",
+    "             #                                   ###                 ######               ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+    "                                                                                          ",
+]
 
 # ---------------------------------------------------------------------------
-# Panel icons, drawn inside an 88x88 box at (x, y).
+# Hero scenes, each drawn inside a 292x92 box at (x, y).
 # ---------------------------------------------------------------------------
 
 
-def icon_bridge(canvas, x, y):
-    draw_line(canvas, x + 4, y + 40, x + 84, y + 40, 5, INK)
-    draw_line(canvas, x + 24, y + 10, x + 24, y + 58, 5, INK)
-    draw_line(canvas, x + 64, y + 10, x + 64, y + 58, 5, INK)
-    arc = []
-    for i in range(41):
-        t = i / 40
-        px = x + 4 + 80 * t
-        py = y + 12 + 26 * (4 * t * (1 - t)) * 0.9
-        arc.append((px, py))
-    draw_polyline(canvas, arc, 4, ACCENT)
-    for hx in (36, 44, 52):
-        top = y + 12 + 26 * (4 * ((hx - 4) / 80) * (1 - (hx - 4) / 80)) * 0.9
-        draw_line(canvas, x + hx, int(top), x + hx, y + 40, 3, ACCENT)
-    for wy in (64, 74, 84):
-        wave = []
-        for i in range(21):
-            px = x + 4 + 4 * i
-            py = y + wy + 3 * math.sin(i * 1.1 + wy)
-            wave.append((px, py))
-        draw_polyline(canvas, wave, 3, GRAY)
+def scene_bridges(page, x, y):
+    rect(page, x, y, x + 292, y + 92, SKY)
+    for sx, sy in ((30, 14), (90, 8), (150, 18), (230, 10), (265, 22), (60, 26), (200, 28)):
+        dot(page, x + sx, y + sy, 2, PAPER)
+    for bx, bw, bh in ((8, 34, 26), (52, 22, 36), (120, 40, 20), (215, 30, 30), (255, 26, 22)):
+        rect(page, x + bx, y + 66 - bh, x + bx + bw, y + 66, INK)
+    rect(page, x, y + 74, x + 292, y + 92, SEA)
+    for cx in (62, 146, 230):
+        pts = [(x + cx - 34, y + 74)]
+        for i in range(9):
+            pts.append((x + cx - 34 + i * 8 + 4, y + 74 - int(10 * math.sin(math.pi * (i + 0.5) / 8))))
+        pts.append((x + cx + 34, y + 74))
+        poly(page, pts, 3, GOLD)
+        line(page, x + cx, y + 64, x + cx, y + 74, 3, GOLD)
+    for tx, ty, ex, ey in ((286, 2, 230, 62), (250, 0, 146, 60), (200, 4, 62, 62)):
+        steps = 26
+        for i in range(0, steps, 2):
+            t0 = i / steps
+            px = int(tx + (ex - tx) * t0 + 26 * math.sin(t0 * math.pi) * -0.4)
+            py = int(ty + (ey - ty) * t0)
+            dot(page, x + px, y + py, 3, GOLD)
+        for dx, dy in ((0, -8), (6, -5), (8, 0), (6, 5), (0, 8), (-6, 5), (-8, 0), (-6, -5)):
+            line(page, x + ex, y + ey, x + ex + dx, y + ey + dy, 3, RED)
+        dot(page, x + ex, y + ey, 6, GOLD)
 
 
-def icon_cyclone(canvas, x, y):
-    cx, cy = x + 42, y + 40
-    points = []
-    theta = 0.0
-    while theta < 10.6:
-        r = 3 + 3.6 * theta
-        points.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
-        theta += 0.15
-    draw_polyline(canvas, points, 5, INK)
-    plot(canvas, cx, cy, 9, ACCENT)
-    draw_line(canvas, x + 4, y + 84, x + 84, y + 84, 4, GRAY)
+def scene_cyclone(page, x, y):
+    rect(page, x, y, x + 292, y + 92, SEA)
+    coast = [(0, 0), (70, 0), (86, 18), (74, 34), (96, 52), (84, 70), (104, 92), (0, 92)]
+    pts = coast + [(0, 0)]
+    for i in range(len(coast) - 1):
+        line(page, x + coast[i][0], y + coast[i][1], x + coast[i + 1][0], y + coast[i + 1][1], 26, SAND)
+    cx, cy = x + 196, y + 46
+    for r in (38, 29, 20, 12):
+        ring(page, cx, cy, r, 4, PAPER)
+    disc(page, cx, cy, 5, PAPER)
+    for i in range(12):
+        t = i / 11
+        dot(page, x + 96 + int(70 * t), y + 66 - int(16 * t), 3, RED)
+    disc(page, x + 92, y + 64, 6, RED)
+    text(page, x + 8, y + 8, "ODISHA", 1, INK)
+    text(page, x + 112, y + 82, "BAY OF BENGAL", 1, PAPER)
 
 
-def icon_chart(canvas, x, y):
-    draw_line(canvas, x + 10, y + 8, x + 10, y + 78, 4, GRAY)
-    draw_line(canvas, x + 10, y + 78, x + 84, y + 78, 4, GRAY)
-    points = [(x + 16, y + 24), (x + 34, y + 38), (x + 50, y + 32), (x + 66, y + 56), (x + 80, y + 66)]
-    draw_polyline(canvas, points, 6, ACCENT)
-    draw_line(canvas, x + 80, y + 66, x + 66, y + 64, 6, ACCENT)
-    draw_line(canvas, x + 80, y + 66, x + 78, y + 52, 6, ACCENT)
+def scene_missiles(page, x, y):
+    rect(page, x, y, x + 292, y + 58, SKY)
+    rect(page, x, y + 58, x + 292, y + 92, GREEN)
+    for sx, sy in ((40, 12), (120, 8), (210, 16), (265, 8)):
+        dot(page, x + sx, y + sy, 2, PAPER)
+    rect(page, x + 18, y + 44, x + 44, y + 58, INK)
+    rect(page, x + 240, y + 40, x + 268, y + 58, INK)
+    line(page, x + 236, y + 6, x + 168, y + 56, 7, GOLD)
+    line(page, x + 246, y + 12, x + 236, y + 6, 5, RED)
+    line(page, x + 228, y + 16, x + 236, y + 6, 5, RED)
+    for i in range(9):
+        dot(page, x + 240 - i * 9, y + 4 + i * 6, 3, GREY)
+    for dx, dy in ((0, -10), (8, -6), (10, 0), (8, 6), (0, 10), (-8, 6), (-10, 0), (-8, -6)):
+        line(page, x + 160, y + 62, x + 160 + dx, y + 62 + dy, 3, RED)
+    dot(page, x + 160, y + 62, 7, GOLD)
 
 
-def icon_flags(canvas, x, y):
-    draw_line(canvas, x + 20, y + 12, x + 20, y + 78, 4, INK)
-    draw_line(canvas, x + 64, y + 12, x + 64, y + 78, 4, INK)
-    fill_rect(canvas, x + 20, y + 12, x + 46, y + 32, INK)
-    fill_rect(canvas, x + 64, y + 12, x + 88, y + 32, ACCENT)
-    draw_line(canvas, x + 12, y + 56, x + 76, y + 56, 4, GRAY)
-    draw_line(canvas, x + 12, y + 56, x + 24, y + 48, 4, GRAY)
-    draw_line(canvas, x + 12, y + 56, x + 24, y + 64, 4, GRAY)
-    draw_line(canvas, x + 76, y + 56, x + 64, y + 48, 4, GRAY)
-    draw_line(canvas, x + 76, y + 56, x + 64, y + 64, 4, GRAY)
+def scene_globe(page, x, y):
+    rect(page, x, y, x + 292, y + 92, SKY)
+    cx, cy = x + 110, y + 46
+    ring(page, cx, cy, 38, 4, PAPER)
+    ring(page, cx, cy, 38, 4, PAPER, squash=0.45)
+    line(page, cx - 38, cy, cx + 38, cy, 3, PAPER)
+    line(page, cx - 33, cy - 21, cx + 33, cy - 21, 3, GREY)
+    line(page, cx - 33, cy + 21, cx + 33, cy + 21, 3, GREY)
+    rect(page, x + 216, y + 14, x + 224, y + 66, PAPER)
+    disc(page, x + 220, y + 74, 11, RED)
+    rect(page, x + 212, y + 30, x + 228, y + 34, RED)
+    rect(page, x + 212, y + 44, x + 228, y + 48, GOLD)
+    text(page, x + 238, y + 30, "HOT", 2, RED)
 
 
-def icon_shield(canvas, x, y):
-    cx = x + 44
-    outline = [
-        (cx, y + 4),
-        (cx + 30, y + 14),
-        (cx + 30, y + 44),
-        (cx, y + 84),
-        (cx - 30, y + 44),
-        (cx - 30, y + 14),
-        (cx, y + 4),
-    ]
-    draw_polyline(canvas, outline, 5, INK)
-    draw_polyline(canvas, [(cx - 14, y + 42), (cx - 4, y + 54), (cx + 16, y + 26)], 6, ACCENT)
+def scene_probe(page, x, y):
+    rect(page, x, y, x + 292, y + 92, SKY)
+    for sx, sy in ((24, 16), (80, 30), (150, 10), (250, 26), (276, 60), (36, 64), (120, 70)):
+        dot(page, x + sx, y + sy, 2, PAPER)
+    disc(page, x + 84, y + 52, 30, SAND)
+    ring(page, x + 70, y + 42, 7, 3, GREY)
+    ring(page, x + 96, y + 62, 5, 3, GREY)
+    ring(page, x + 84, y + 52, 52, 3, GREY)
+    rect(page, x + 196, y + 26, x + 208, y + 38, GOLD)
+    rect(page, x + 178, y + 28, x + 194, y + 36, SEA)
+    rect(page, x + 210, y + 28, x + 226, y + 36, SEA)
+    line(page, x + 202, y + 38, x + 188, y + 52, 3, PAPER)
 
 
-def icon_card(canvas, x, y):
-    draw_line(canvas, x + 8, y + 20, x + 80, y + 20, 4, INK)
-    draw_line(canvas, x + 8, y + 68, x + 80, y + 68, 4, INK)
-    draw_line(canvas, x + 8, y + 20, x + 8, y + 68, 4, INK)
-    draw_line(canvas, x + 80, y + 20, x + 80, y + 68, 4, INK)
-    fill_rect(canvas, x + 8, y + 28, x + 80, y + 38, ACCENT)
-    draw_line(canvas, x + 16, y + 48, x + 30, y + 48, 3, GRAY)
-    draw_line(canvas, x + 16, y + 58, x + 30, y + 58, 3, GRAY)
-    draw_circle(canvas, x + 58, y + 50, 7, 4, INK)
-    draw_line(canvas, x + 63, y + 55, x + 72, y + 64, 4, INK)
-
-
-ICONS = {
-    "bridge": icon_bridge,
-    "cyclone": icon_cyclone,
-    "chart": icon_chart,
-    "flags": icon_flags,
-    "shield": icon_shield,
-    "card": icon_card,
+SCENES = {
+    "bridges": scene_bridges,
+    "cyclone": scene_cyclone,
+    "missiles": scene_missiles,
+    "globe": scene_globe,
+    "probe": scene_probe,
 }
 
 # ---------------------------------------------------------------------------
-# Page content: the verified news of Friday 20 November 2026.
+# The verified news of Friday 20 November 2026.
 # ---------------------------------------------------------------------------
 
 DATE_LINE = "FRIDAY 20 NOVEMBER 2026"
-SUBTITLE = "THE WORLD IN ONE PAGE"
+REGION_BAR = "EUROPE 13 - ASIA 7 - MIDDLE EAST 4 - AMERICAS 11 - AFRICA 1"
 
-PANELS = [
-    {
-        "place": "KYIV, UKRAINE",
-        "headline": ["3 DNIPRO", "BRIDGES HIT"],
-        "body": "RUSSIA'S OVERNIGHT STRIKE DAMAGES KYIV'S RIVER CROSSINGS",
-        "icon": "bridge",
-    },
-    {
-        "place": "ODISHA, INDIA",
-        "headline": ["CYCLONE AKVAN", "LANDFALL"],
-        "body": "300,000 PEOPLE EVACUATED AS THE STORM CROSSES THE EAST COAST",
-        "icon": "cyclone",
-    },
-    {
-        "place": "ASIA MARKETS",
-        "headline": ["AI STOCKS", "SELL OFF"],
-        "body": "NIKKEI FALLS ABOUT 5%. TAIWAN AND CHIP SHARES SLIDE FURTHER",
-        "icon": "chart",
-    },
-    {
-        "place": "UK AND EU",
-        "headline": ["YOUTH MOBILITY", "DEAL"],
-        "body": "UP TO 100,000 YOUNG PEOPLE A YEAR COULD LIVE AND WORK ABROAD",
-        "icon": "flags",
-    },
-    {
-        "place": "HAITI",
-        "headline": ["POLICE RAID", "GANGS"],
-        "body": "34 GANG SUSPECTS KILLED IN MARTISSANT RAID, POLICE SAY",
-        "icon": "shield",
-    },
-    {
-        "place": "UNITED STATES",
-        "headline": ["CARD DATA", "LEAKED"],
-        "body": "VISA, MASTERCARD AND JPMORGAN DATA LEAKED AFTER RANSOMWARE",
-        "icon": "card",
-    },
+STATS = [
+    ("3", "BRIDGES HIT OVER THE DNIPRO"),
+    ("300,000+", "EVACUATED BEFORE AKVAN"),
+    ("100,000", "YOUTH VISAS A YEAR, UK-EU"),
+    ("2.2%", "JAPAN CORE INFLATION"),
+    ("1,000", "LUFTHANSA JOBS AT RISK"),
+    ("341", "FACTORIES SHUT IN DHAKA"),
+]
+
+HEROES = [
+    (
+        "KYIV, UKRAINE",
+        "WAR",
+        "3 DNIPRO BRIDGES HIT",
+        "BARRAGE CUT POWER AND WATER IN KYIV (BBC)",
+        "bridges",
+    ),
+    (
+        "ODISHA, INDIA",
+        "CYCLONE",
+        "CYCLONE AKVAN LANDFALL",
+        "300,000+ IN SHELTERS. NO DEATHS REPORTED (IMD)",
+        "cyclone",
+    ),
+    (
+        "LUBLIN, POLAND",
+        "SECURITY",
+        "MISSILES LAND IN POLAND",
+        "IT FELL IN A FIELD. TWO AIRPORTS PAUSED (REUTERS)",
+        "missiles",
+    ),
+]
+
+MID = [
+    ("ASIA MARKETS", "MARKETS", "AI STOCKS SELL OFF ACROSS ASIA"),
+    ("ANTALYA, TURKIYE", "CLIMATE", "COP31 OVERRUNS, DRAFT DROPS FOSSIL FUELS"),
+    ("KERCH, CRIMEA", "WAR", "UKRAINE HITS KERCH BRIDGE 3RD TIME"),
+    ("HORMUZ, IRAN", "ENERGY", "TANKER CATCHES FIRE NEAR HORMUZ"),
+    ("UK AND EU", "DIPLOMACY", "YOUTH MOBILITY DEAL, 100,000 A YEAR"),
+    ("HAITI", "SECURITY", "POLICE RAID GANGS, 34 KILLED, POLICE SAY"),
+    ("UNITED STATES", "CRIME", "VISA, MASTERCARD CARD DATA LEAKED"),
+    ("TOKYO, JAPAN", "ECONOMY", "CORE INFLATION RISES TO 2.2%"),
+    ("DHAKA, BANGLADESH", "LABOUR", "341 GARMENT FACTORIES SHUT IN UNREST"),
+]
+
+ALSO = [
+    "SHENZHEN: 3-LEADER PACT",
+    "BERLIN: ALLIES MEET",
+    "DENMARK: GREENLAND PACT",
+    "DENMARK: ENVOY EXPELLED",
+    "ESTONIA: BORDER SHUT",
+    "KHARKIV: 14 RETAKEN",
+    "SMOLENSK: PLANT HIT",
+    "PARIS: IEA HORMUZ SHOCK",
+    "IRAQ: TOWN RECAPTURED",
+    "GAZA: LINE CROSSED",
+    "NYC: S&P 500 CORRECTION",
+    "WASHINGTON: AI TAX IDEA",
+    "ARGENTINA: BONDS SLIDE",
+    "NVIDIA: EXPORT RECORDS",
+    "LA: FIRE VERDICT",
+    "MISSOURI: BAYER DEAL",
+    "NEW YORK: GUPTA JAILED",
+    "PARIS: OFFICERS GUILTY",
+    "SAN FRANCISCO: RIEMANN",
+    "USA: CANCER PILL TRIAL",
+    "TAIPEI: CHIP PAUSE",
+    "FRANKFURT: JOB CUTS",
+    "SUDAN: GOLD MINE STRUCK",
+    "SHENZHEN: WAR-AI VOW",
+]
+
+PINS = [
+    (53, 9),
+    (66, 16),
+    (51, 9),
+    (74, 15),
+    (52, 12),
+    (54, 10),
+    (59, 14),
+    (46, 9),
+    (27, 16),
+    (27, 11),
+    (80, 12),
+    (68, 15),
+]
+
+DATE_CHECK = [
+    "LEFT OUT AS NOT FRIDAY: WORLD COURT ON",
+    "MYANMAR (THU 19) - GTA VI LAUNCH (WED 18)",
+    "- ANTHROPIC IPO DEBUT (THU 19) - MERCURY",
+    "ORBIT ARRIVAL IS SAT 21, NOT SHOWN HERE",
 ]
 
 
-def draw_panel(canvas, px, py, panel):
-    w, h = 480, 250
-    fill_rect(canvas, px, py, px + w, py + 3, INK)
-    fill_rect(canvas, px, py + h - 3, px + w, py + h, INK)
-    fill_rect(canvas, px, py, px + 3, py + h, INK)
-    fill_rect(canvas, px + w - 3, py, px + w, py + h, INK)
-    draw_text(canvas, px + 16, py + 12, panel["place"], 4, ACCENT)
-    hy = py + 48
-    for line in panel["headline"]:
-        draw_text(canvas, px + 16, hy, line, 5, INK)
-        hy += 43
-    fill_rect(canvas, px + 16, py + 134, px + w - 16, py + 136, GRAY)
-    ICONS[panel["icon"]](canvas, px + 16, py + 146)
-    lines = wrap_text(panel["body"], 19)
-    ly = py + 142
-    for line in lines[:4]:
-        draw_text(canvas, px + 124, ly, line, 3, INK)
-        ly += 25
+def draw_hero(page, px, py, num, place, cat, headline, body, scene):
+    w, h = 320, 240
+    rect(page, px, py, px + w, py + h, CARD)
+    rect(page, px, py, px + w, py + 4, RED)
+    rect(page, px, py + h - 2, px + w, py + h, INK)
+    rect(page, px, py, px + 2, py + h, INK)
+    rect(page, px + w - 2, py, px + w, py + h, INK)
+    SCENES[scene](page, px + 14, py + 12)
+    rect(page, px + 14, py + 112, px + 36, py + 134, RED)
+    text(page, px + 20, py + 116, str(num), 2, PAPER, bold=True)
+    label = place + " - " + cat
+    if text_w(label, 2) > w - 62:
+        label = place
+    text(page, px + 44, py + 116, label, 2, RED, bold=True)
+    hy = py + 142
+    for ln in wrap(headline, 17)[:2]:
+        text(page, px + 14, hy, ln, 3, INK)
+        hy += 26
+    by = py + 198
+    for ln in wrap(body, 25)[:2]:
+        text(page, px + 14, by, ln, 2, GREY)
+        by += 16
 
 
-def draw_page():
-    canvas = make_canvas(WIDTH, HEIGHT, PAPER)
-    fill_rect(canvas, 0, 0, WIDTH, 148, INK)
-    draw_text_centered(canvas, 49, DATE_LINE, 7, PAPER)
-    fill_rect(canvas, 0, 148, WIDTH, 160, ACCENT)
-    draw_text_centered(canvas, 172, SUBTITLE, 4, INK)
-    fill_rect(canvas, 24, 212, WIDTH - 24, 214, INK)
-    top = 224
-    for i, panel in enumerate(PANELS):
-        px = 24 if i % 2 == 0 else 520
-        py = top + (i // 2) * 260
-        draw_panel(canvas, px, py, panel)
-    return canvas
+def draw_mid(page, px, py, num, place, cat, headline):
+    rect(page, px + 1, py + 2, px + 19, py + 20, RED)
+    text(page, px + 5, py + 5, str(num), 1, PAPER, bold=True)
+    label = place + " - " + cat
+    if text_w(label, 2) > 288:
+        label = place
+    text(page, px + 26, py + 4, label, 2, INK, bold=True)
+    hy = py + 26
+    for ln in wrap(headline, 25)[:2]:
+        text(page, px + 26, hy, ln, 2, INK)
+        hy += 16
 
 
-def encode_png(canvas):
-    height = len(canvas)
-    width = len(canvas[0]) // 3
+def draw_map(page, ox, oy, cell):
+    for r, row in enumerate(WORLD):
+        for c, ch in enumerate(row):
+            if ch == "#":
+                rect(page, ox + c * cell, oy + r * cell, ox + c * cell + cell - 1, oy + r * cell + cell - 1, MAPLAND)
+    for i, (gx, gy) in enumerate(PINS):
+        cx, cy = ox + gx * cell, oy + gy * cell
+        disc(page, cx, cy, 4, RED)
+        text(page, cx + 6, cy - 4, str(i + 1), 1, RED, bold=True)
+
+
+def render():
+    page = new_page()
+    rect(page, 0, 0, PAGE_W, 88, INK)
+    text_mid(page, 8, "THE WORLD IN ONE PAGE", 1, PAPER)
+    text_mid(page, 28, DATE_LINE, 6, PAPER)
+    rect(page, 0, 88, PAGE_W, 94, RED)
+    # Day in numbers.
+    for i, (num, cap) in enumerate(STATS):
+        cx = 20 + i * 164
+        if i:
+            rect(page, cx - 8, 106, cx - 7, 152, GREY)
+        text(page, cx, 104, num, 3, RED if i % 2 else INK, bold=True)
+        cy = 132
+        for ln in wrap(cap, 15)[:2]:
+            text(page, cx, cy, ln, 1, GREY)
+            cy += 10
+    # Region bar.
+    rect(page, 0, 162, PAGE_W, 184, INK)
+    text_mid(page, 167, REGION_BAR, 2, PAPER)
+    # Heroes.
+    for i, (place, cat, headline, body, scene) in enumerate(HEROES):
+        draw_hero(page, 20 + i * 332, 196, i + 1, place, cat, headline, body, scene)
+    # Featured grid.
+    for i, (place, cat, headline) in enumerate(MID):
+        cx = 20 + (i % 3) * 332
+        cy = 452 + (i // 3) * 78
+        draw_mid(page, cx, cy, i + 4, place, cat, headline)
+        if i % 3 == 2 and i < 6:
+            rect(page, 20, cy + 68, PAGE_W - 20, cy + 69, GREY)
+    # Also today.
+    text(page, 20, 692, "ALSO ON FRIDAY 20 NOVEMBER - 24 MORE STORIES", 2, RED, bold=True)
+    for i, item in enumerate(ALSO):
+        cx = 20 + (i // 8) * 332
+        cy = 718 + (i % 8) * 16
+        text(page, cx, cy, str(i + 13) + " " + item, 2, INK)
+    rect(page, 20, 852, PAGE_W - 20, 853, INK)
+    # Map and date check.
+    text(page, 20, 862, "WHERE IT HAPPENED", 2, INK, bold=True)
+    draw_map(page, 20, 884, 3)
+    bx = 330
+    rect(page, bx, 862, PAGE_W - 20, 1004, PAPER)
+    rect(page, bx, 862, PAGE_W - 20, 866, RED)
+    rect(page, bx, 1000, PAGE_W - 20, 1004, RED)
+    rect(page, bx, 862, bx + 4, 1004, RED)
+    rect(page, PAGE_W - 24, 862, PAGE_W - 20, 1004, RED)
+    text(page, bx + 16, 876, "DATE CHECK", 2, RED, bold=True)
+    dy = 904
+    for ln in DATE_CHECK:
+        text(page, bx + 16, dy, ln, 2, INK)
+        dy += 22
+    text_mid(page, 1010, "EVERY STORY HAPPENED, OR WAS FIRST REPORTED, ON FRIDAY 20 NOVEMBER 2026", 1, GREY)
+    return page
+
+
+def to_png(page):
     raw = bytearray()
-    for row in canvas:
+    for row in page:
         raw.append(0)
         raw += row
 
@@ -357,14 +549,14 @@ def encode_png(canvas):
         return out
 
     png = bytearray(b"\x89PNG\r\n\x1a\n")
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", PAGE_W, PAGE_H, 8, 2, 0, 0, 0))
     png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
     png += chunk(b"IEND", b"")
     return bytes(png)
 
 
 def main():
-    data = encode_png(draw_page())
+    data = to_png(render())
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR")
     if not out_dir:
         out_dir = "/output" if os.path.isdir("/output") and os.access("/output", os.W_OK) else "out"
